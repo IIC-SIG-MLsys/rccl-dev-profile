@@ -426,6 +426,48 @@ __device__ __forceinline__ unsigned long long int globaltimer() {
 #endif
 }
 
+__device__ __forceinline__ struct ncclDevProfilerRecord* ncclDevProfilerRecordAt(uint64_t workCounter) {
+  return &ncclShmem.comm.workCompleted[ncclShmem.channelId].data[workCounter % MAX_PROFILER_EVENTS_PER_CHANNEL];
+}
+
+__device__ __forceinline__ uint64_t ncclPrimProfileStart(bool groupLeader) {
+  return (ncclShmem.profilerEnabled && groupLeader) ? globaltimer() : 0;
+}
+
+__device__ __forceinline__ uint64_t ncclTbStageProfileStart(bool groupLeader) {
+  return (ncclShmem.profilerEnabled && groupLeader) ? globaltimer() : 0;
+}
+
+__device__ __forceinline__ void ncclTbStageProfileAdd(enum ncclTbStageKind kind, bool groupLeader, uint64_t start, uint64_t stop) {
+  if (!ncclShmem.profilerEnabled || !groupLeader) return;
+  if (stop <= start) return;
+  struct ncclDevProfilerRecord* rec = ncclDevProfilerRecordAt(ncclShmem.workCounter);
+  uint64_t cycles = stop - start;
+  atomicAdd(reinterpret_cast<unsigned long long*>(rec->stageCycles + kind), static_cast<unsigned long long>(cycles));
+}
+
+__device__ __forceinline__ void ncclPrimProfileAdd(enum ncclPrimProfileKind kind, uint8_t group, bool groupLeader, uint64_t start, uint64_t stop) {
+  if (!ncclShmem.profilerEnabled || !groupLeader) return;
+  if (stop <= start) return;
+  struct ncclDevProfilerRecord* rec = ncclDevProfilerRecordAt(ncclShmem.workCounter);
+  uint64_t cycles = stop - start;
+  atomicAdd(reinterpret_cast<unsigned long long*>(rec->primCycles + kind), static_cast<unsigned long long>(cycles));
+  atomicAdd(rec->primCalls + kind, 1u);
+  uint32_t idx = atomicAdd(&rec->primTraceCount, 1u);
+  if (idx < NCCL_PRIM_TRACE_MAX_PER_WORK) {
+    rec->primTrace[idx].kind = (uint8_t)kind;
+    rec->primTrace[idx].group = group;
+    rec->primTrace[idx].reserved0 = 0;
+    rec->primTrace[idx].seq = idx;
+    rec->primTrace[idx].start = start;
+    rec->primTrace[idx].stop = stop;
+  } else {
+    atomicAdd(&rec->primTraceDropped, 1u);
+  }
+}
+
+__device__ __forceinline__ bool profilerEnabled(int workItemIdx);
+
 template<ncclFunc_t Fn, typename T, typename RedOp, int Algo, int Proto, int USE_ACC, int COLL_UNROLL, int Pipeline>
 struct RunWorkColl {
   __device__ void run(int tid, int tn, struct ncclDevWorkColl* work) {
@@ -467,6 +509,28 @@ struct RunWorkBatch {
         struct ncclDevWorkColl* workPrev = (struct ncclDevWorkColl*)(ncclShmem.workStorage + (w-1)*ncclShmem.workSize);
         if (work->nWarps != workPrev->nWarps) __syncthreads();
       }
+      if (tid == 0) {
+        uint64_t wc = ncclShmem.channel.workCounter + 1 + w;
+        ncclShmem.workCounter = wc;
+        ncclShmem.profilerEnabled = profilerEnabled(w);
+        if (ncclShmem.profilerEnabled) {
+          struct ncclDevProfilerRecord* rec = ncclDevProfilerRecordAt(wc);
+          rec->tbStart = globaltimer();
+          rec->tbStop = 0;
+          rec->primTraceCount = 0;
+          rec->primTraceDropped = 0;
+          #pragma unroll
+          for (int s = 0; s < ncclTbStageN; s++) {
+            rec->stageCycles[s] = 0;
+          }
+          #pragma unroll
+          for (int p = 0; p < ncclPrimN; p++) {
+            rec->primCycles[p] = 0;
+            rec->primCalls[p] = 0;
+          }
+        }
+      }
+      __syncthreads();
       int subtn = work->nWarps*WARP_SIZE;
 #ifdef ENABLE_WARP_SPEED
       if (tid < subtn) {
@@ -479,6 +543,10 @@ struct RunWorkBatch {
       // coverity[device_thread_diverged:FALSE]
       if (tid < subtn) RunWorkColl<Fn, T, RedOp, Algo, Proto>().run(tid, subtn, work);
 #endif
+      __syncthreads();
+      if (tid == 0 && ncclShmem.profilerEnabled) {
+        ncclDevProfilerRecordAt(ncclShmem.workCounter)->tbStop = globaltimer();
+      }
     }
   }
 };

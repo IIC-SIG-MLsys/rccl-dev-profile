@@ -12,17 +12,13 @@
 #include "nccl.h"
 #include "rccl_float8.h"
 #if ROCM_VERSION >= 60000
-  // This is a workaround for the fact that the old hip_bfloat16.h header file may still be used by some rocm files.
-  // The _HIP_INCLUDE_HIP_AMD_DETAIL_HIP_BFLOAT16_H_ and _HIP_BFLOAT16_H_ macros are defined in the old hip_bfloat16.h header
   #if !defined(_HIP_INCLUDE_HIP_AMD_DETAIL_HIP_BFLOAT16_H_) && !defined(_HIP_BFLOAT16_H_)
     #define _HIP_INCLUDE_HIP_AMD_DETAIL_HIP_BFLOAT16_H_
     #define _HIP_BFLOAT16_H_
     #include <hip/hip_bf16.h>
     typedef __hip_bfloat16 hip_bfloat16;
-  #elif ROCM_VERSION >= 70000
-    #include <hip/hip_bf16.h>
   #else
-    #error "RCCL is not using the correct hip_bf16.h file. Please make sure that the correct header is included!"
+    #include <hip/hip_bf16.h>
   #endif
 #else
   #include <hip/hip_bfloat16.h>
@@ -633,11 +629,80 @@ struct alignas(16) ncclDevChannel {
 };
 
 #define MAX_PROFILER_EVENTS_PER_CHANNEL 64
+// 64 trace rows are not enough for large ring/simple works (for example ~480 primitive
+// invocations per work in an 8-rank allreduce). Keep workStarted lightweight and allow
+// workCompleted to retain a near-complete per-work timeline even when a work contains
+// multiple primitive groups.
+#define NCCL_PRIM_TRACE_MAX_PER_WORK 1024
+enum ncclTbStageKind : uint8_t {
+  ncclTbStageWait = 0,
+  ncclTbStageCompute,
+  ncclTbStageSync,
+  ncclTbStageN,
+};
+
+enum ncclPrimProfileKind : uint8_t {
+  ncclPrimSend = 0,
+  ncclPrimSendFromOutput,
+  ncclPrimDirectSend,
+  ncclPrimDirectSendFromOutput,
+  ncclPrimRecv,
+  ncclPrimDirectRecv,
+  ncclPrimDirectRecvCopy,
+  ncclPrimCopySend,
+  ncclPrimDirectCopySend,
+  ncclPrimRecvSend,
+  ncclPrimRecvCopySend,
+  ncclPrimDirectRecvCopyDirectSend,
+  ncclPrimDirectRecvDirectSend,
+  ncclPrimRecvDirectSend,
+  ncclPrimDirectRecvSend,
+  ncclPrimRecvCopyDirectSend,
+  ncclPrimRecvReduceCopy,
+  ncclPrimDirectRecvReduceCopy,
+  ncclPrimRecvReduceSend,
+  ncclPrimDirectRecvReduceSend,
+  ncclPrimRecvReduceDirectSend,
+  ncclPrimDirectRecvReduceDirectSend,
+  ncclPrimRecvReduceCopySend,
+  ncclPrimRecvReduceCopyDirectSend,
+  ncclPrimDirectRecvReduceCopyDirectSend,
+  ncclPrimN,
+};
+
+struct ncclDevPrimTraceEvent {
+  uint8_t kind;
+  uint8_t group;
+  uint16_t reserved0;
+  uint32_t seq;
+  uint64_t start;
+  uint64_t stop;
+};
+
+struct ncclDevProfilerStartRecord {
+  uint64_t counter;
+  uint64_t timestamp;
+};
+
+struct ncclDevProfilerStart {
+  struct ncclDevProfilerStartRecord data[MAX_PROFILER_EVENTS_PER_CHANNEL];
+};
+
+struct ncclDevProfilerRecord {
+  uint64_t counter;
+  uint64_t timestamp;
+  uint64_t tbStart;
+  uint64_t tbStop;
+  uint64_t stageCycles[ncclTbStageN];
+  uint64_t primCycles[ncclPrimN];
+  uint32_t primCalls[ncclPrimN];
+  uint32_t primTraceCount;
+  uint32_t primTraceDropped;
+  struct ncclDevPrimTraceEvent primTrace[NCCL_PRIM_TRACE_MAX_PER_WORK];
+};
+
 struct ncclDevProfiler {
-  struct {
-    uint64_t counter;
-    uint64_t timestamp;
-  } data[MAX_PROFILER_EVENTS_PER_CHANNEL];
+  struct ncclDevProfilerRecord data[MAX_PROFILER_EVENTS_PER_CHANNEL];
 };
 
 struct ncclKernelComm {
@@ -662,7 +727,7 @@ struct ncclKernelComm {
   int* rankToLocalRank;
 
   // Profiler counters
-  struct ncclDevProfiler* workStarted/*[MAXCHANNELS]*/;
+  struct ncclDevProfilerStart* workStarted/*[MAXCHANNELS]*/;
   struct ncclDevProfiler* workCompleted/*[MAXCHANNELS]*/;
 
 #if defined(ENABLE_NPKIT)

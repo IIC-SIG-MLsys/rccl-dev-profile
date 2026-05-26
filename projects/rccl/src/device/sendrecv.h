@@ -16,6 +16,35 @@ template<typename T, typename RedOp>
 struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
   static_assert(sizeof(T)==1, "SendRecv only works on single byte types T.");
 
+  __device__ __forceinline__ uint64_t profileGlobalTimer() {
+    return wall_clock64();
+  }
+
+  __device__ __forceinline__ void initProfilerWorkState(
+      uint64_t workCounter, bool enabled
+    ) {
+    if (threadIdx.x == 0) {
+      ncclShmem.workCounter = workCounter;
+      ncclShmem.profilerEnabled = enabled;
+      if (enabled) {
+        struct ncclDevProfilerRecord* rec =
+          &ncclShmem.comm.workCompleted[ncclShmem.channelId].data[workCounter % MAX_PROFILER_EVENTS_PER_CHANNEL];
+        rec->tbStart = profileGlobalTimer();
+        rec->tbStop = 0;
+        rec->primTraceCount = 0;
+        rec->primTraceDropped = 0;
+        #pragma unroll
+        for (int s = 0; s < ncclTbStageN; s++) rec->stageCycles[s] = 0;
+        #pragma unroll
+        for (int p = 0; p < ncclPrimN; p++) {
+          rec->primCycles[p] = 0;
+          rec->primCalls[p] = 0;
+        }
+      }
+    }
+    __syncthreads();
+  }
+
   template<typename Proto>
   __device__ void runSend(int tid, int tn, int group, struct ncclDevWorkP2p* work) {
     size_t bytes = work->sendBytes;
@@ -148,6 +177,8 @@ struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
     struct Shared {
       uint32_t workSendMask; // bitmasks of which work indices have send/recv
       uint32_t workRecvMask;
+      uint32_t profEnabledMask;
+      int profileMode;
     };
     Shared* shared = (Shared*)ncclScratchForWarp(0);
 
@@ -182,6 +213,12 @@ struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
       if (lane == 0) {
         shared->workSendMask = mask>>16;
         shared->workRecvMask = mask & 0xffff;
+        uint32_t profMask = 0;
+        for (int i = 0; i < nWorks && i < 32; i++) {
+          if (works[i].profilerEnabled) profMask |= (1u << i);
+        }
+        shared->profEnabledMask = profMask;
+        shared->profileMode = (profMask != 0) ? 1 : 0;
       }
     }
 
@@ -208,8 +245,86 @@ struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
 
     uint32_t workSendMask = shared->workSendMask;
     uint32_t workRecvMask = shared->workRecvMask;
+    uint32_t profEnabledMask = shared->profEnabledMask;
+    int profileMode = shared->profileMode;
 
     __syncthreads(); // release scratch space used by shared->*
+
+    if (profileMode) {
+      const int nSendWarpsForExtraGroup = NCCL_SIMPLE_EXTRA_GROUP_IF_NTHREADS_GE/WARP_SIZE;
+      for (int w = 0; w < nWorks; w++) {
+        bool hasSend = 1 & (workSendMask >> w);
+        bool hasRecv = 1 & (workRecvMask >> w);
+        if (!hasSend && !hasRecv) continue;
+
+        bool profThisWork = 1 & (profEnabledMask >> w);
+        uint64_t wc = ncclShmem.channel.workCounter + 1 + w;
+        initProfilerWorkState(wc, profThisWork);
+
+        struct ncclDevWorkP2p* work = &works[w];
+        bool isCopy = work->sendRank == ncclShmem.comm.rank;
+        int nWarpPerWork = nWarps;
+        int nRecvWarpPerWork = nWarpPerWork<=4 ? nWarpPerWork/2 : (nWarpPerWork-1)/2;
+        int nSendWarpPerWork = nWarpPerWork<=4 ? nRecvWarpPerWork : nRecvWarpPerWork+1;
+        nWarpPerWork = nSendWarpPerWork + nRecvWarpPerWork;
+        int subtid = tid;
+        int subtn = nWarpPerWork*WARP_SIZE;
+        int group = 0;
+        bool isSend = !hasRecv || (hasSend && subtid < nSendWarpPerWork*WARP_SIZE);
+
+        if (!isCopy && hasSend && hasRecv) {
+          if (isSend) {
+            subtn = nSendWarpPerWork*WARP_SIZE;
+          } else {
+            subtid -= nSendWarpPerWork*WARP_SIZE;
+            subtn = nRecvWarpPerWork*WARP_SIZE;
+            group += 1 + (nSendWarpPerWork >= nSendWarpsForExtraGroup ? 1 : 0);
+          }
+        }
+
+        if (isCopy) {
+#if defined(__gfx942__) || defined(__gfx950__)
+          reduceCopy<COLL_UNROLL*2, 0, RedOp, T, 0,1,1, 0,1,1, /*PreOpSrcs=*/0>
+            (subtid, subtn, 0, nullptr, false, 1, &work->sendAddr, 1, &work->recvAddr, (ssize_t)work->sendBytes);
+#else
+          reduceCopy<COLL_UNROLL, 0, RedOp, T, 0,1,1, 0,1,1, /*PreOpSrcs=*/0>
+            (subtid, subtn, 0, nullptr, false, 1, &work->sendAddr, 1, &work->recvAddr, (ssize_t)work->sendBytes);
+#endif
+        } else if (isSend) {
+          if (work->sendProtoLL) {
+            runSend<ProtoLL>(subtid, subtn, group, work);
+          } else {
+#if defined(__gfx90a__)
+            runSend<ProtoSimple<1,1,0,8>>(subtid, subtn, group, work);
+#elif defined(__gfx908__) || defined(__gfx942__) || defined(__gfx950__)
+            runSend<ProtoSimple<1,1,0,4>>(subtid, subtn, group, work);
+#else
+            runSend<ProtoSimple<1,1>>(subtid, subtn, group, work);
+#endif
+          }
+        } else {
+          if (work->recvProtoLL) {
+            runRecv<ProtoLL>(subtid, subtn, group, work);
+          } else {
+#if defined(__gfx90a__)
+            runRecv<ProtoSimple<1,1,0,8>>(subtid, subtn, group, work);
+#elif defined(__gfx908__) || defined(__gfx942__) || defined(__gfx950__)
+            runRecv<ProtoSimple<1,1,0,4>>(subtid, subtn, group, work);
+#else
+            runRecv<ProtoSimple<1,1>>(subtid, subtn, group, work);
+#endif
+          }
+        }
+        if (threadIdx.x == 0 && profThisWork) {
+          struct ncclDevProfilerRecord* rec =
+            &ncclShmem.comm.workCompleted[ncclShmem.channelId].data[wc % MAX_PROFILER_EVENTS_PER_CHANNEL];
+          rec->tbStop = profileGlobalTimer();
+        }
+        __syncthreads();
+      }
+      return;
+    }
+
     if (nWorks <= workIx) return;
 
     // Thread range for whole work (send & recv combined)

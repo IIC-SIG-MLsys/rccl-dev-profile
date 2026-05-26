@@ -18,10 +18,12 @@ struct ncclInfo;
 struct ncclComm;
 struct ncclProxyOp;
 struct ncclProxyConnector;
+struct ncclDevProfilerStart;
+struct ncclDevProfiler;
 
 struct ncclProfilerProxy {
   bool initialized;
-  struct ncclDevProfiler* workStarted/*[MAXCHANNELS]*/;
+  struct ncclDevProfilerStart* workStarted/*[MAXCHANNELS]*/;
   struct ncclDevProfiler* workCompleted/*[MAXCHANNELS]*/;
   uint64_t workCounter[MAXCHANNELS]; // host work counter
   struct ncclProxyConnector sendProxyConn[MAXCHANNELS];
@@ -104,6 +106,8 @@ ncclResult_t ncclProfilerRecordProxyCtrlEventState(void*eHandle, int appended, n
 ncclResult_t ncclProfilerAddPidToProxyOp(struct ncclProxyOp* op);
 bool ncclProfilerNeedsProxy(struct ncclComm* comm, struct ncclProxyOp* op);
 bool ncclProfilerPluginLoaded(void);
+bool ncclPrimProfileEnabled(void);
+bool ncclKernelChProfilingEnabled(int eActivationMask);
 
 // Profiler callback for network plugin
 ncclResult_t ncclProfilerCallback(void** eHandle, int type, void* pHandle, int64_t pluginId, void* extData);
