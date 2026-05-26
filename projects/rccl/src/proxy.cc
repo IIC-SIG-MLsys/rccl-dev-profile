@@ -447,12 +447,6 @@ static ncclResult_t ncclProxyOpToArgs(struct ncclProxyOp* op, struct ncclProxyAr
   args->specifics = op->specifics;
   args->state = ncclProxyOpReady;
   args->progress = op->connection->tcomm->proxyProgress;
-  static int proxAppendCount = 0;
-  if (proxAppendCount < 5 && op->connection->tcomm->proxyProgress != NULL) {
-    fprintf(stderr, "[RCCL-PROFILE] ProxyAppend progress=%p tp=%d\n", (void*)op->connection->tcomm->proxyProgress, op->connection->transport);
-    fflush(stderr);
-    proxAppendCount++;
-  }
   args->proxyAppendPtr = op->connection->proxyAppendPtr;
 exit:
   if (args->pattern != ncclPatternProfiler) ncclProfilerStartProxyOpEvent(subIndex, args);
@@ -586,8 +580,6 @@ static ncclResult_t SaveProxyProfiler(struct ncclComm* comm, struct ncclProxyOp*
     *justInquire = true;
     if (!comm->planner.persistent) incWorkCounter(comm, op);
   } else {
-    fprintf(stderr, "[RCCL-PROFILE] SaveProxyProfiler REAL ch=%d coll=%d\n", op->channelId, op->coll);
-    fflush(stderr);
     op->sendbuff = (uint8_t *)comm->profiler.workStarted;
     op->recvbuff = (uint8_t *)comm->profiler.workCompleted;
     // Ensure that in graph capturing the proxy workCounter is incremented to keep up with kernel workCounter
@@ -1061,14 +1053,8 @@ ncclResult_t ncclProxyStart(struct ncclComm* comm) {
   struct ncclProxyOps* proxyOps = comm->proxyState->proxyOps;
   if (proxyOps == NULL) return ncclSuccess;
   TIME_START(1);
-  static int debugCount = 0;
   for (int r = 0; r < comm->sharedRes->tpNLocalRanks; r++) {
     struct ncclProxyOps* ops = proxyOps + r;
-    if (debugCount < 10 && ops->nextOps != -1) {
-      fprintf(stderr, "[RCCL-PROFILE] ncclProxyStart posting rank=%d pool=%p nextOps=%d\n", r, (void*)ops->pool, ops->nextOps);
-      fflush(stderr);
-      debugCount++;
-    }
     if (ops->pool == NULL || ops->nextOps == -1) continue;
     NCCLCHECK(ncclProxyPost(ops->pool, ops->nextOps, ops->nextOpsEnd));
     ops->nextOps = ops->nextOpsEnd = -1;

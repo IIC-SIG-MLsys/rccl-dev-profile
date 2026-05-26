@@ -223,8 +223,6 @@ static ncclResult_t profilerProxyConnect(struct ncclProxyConnection* connection,
 }
 
 static ncclResult_t profilerProxyProgress(struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
-  fprintf(stderr, "[RCCL-PROFILE] profilerProxyProgress ENTER state=%d nsubs=%d\n", (int)args->state, args->nsubs);
-  fflush(stderr);
   if (args->state == ncclProxyOpReady) {
     for (int s = 0; s < args->nsubs; s++) {
       struct ncclProxySubArgs* sub = args->subs + s;
