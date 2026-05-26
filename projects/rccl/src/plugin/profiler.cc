@@ -679,11 +679,6 @@ exit:
 
 bool ncclProfilerNeedsProxy(struct ncclComm* comm, struct ncclProxyOp* op) {
   bool enabled = ncclPrimProfileEnabled() || (ncclProfilerPluginLoaded() && (op->eActivationMask & ncclProfileKernelCh));
-  static int callCount = 0;
-  if (callCount < 5) {
-    fprintf(stderr, "[RCCL-PROFILE-DEBUG] ncclProfilerNeedsProxy() = %d (initialized=%d)\n", (int)enabled, (int)comm->profiler.initialized);
-    callCount++;
-  }
   if (enabled && !comm->profiler.initialized) (void)proxyProfilerConnect(comm, op);
   return enabled;
 }
@@ -693,19 +688,11 @@ bool ncclProfilerPluginLoaded(void) {
 }
 
 bool ncclPrimProfileEnabled(void) {
-  int64_t val = ncclParamPrimProfile();
-  fprintf(stderr, "[RCCL-PROFILE-DEBUG] ncclPrimProfileEnabled() = %lld\n", (long long)val);
-  return val != 0;
+  return ncclParamPrimProfile() != 0;
 }
 
 bool ncclKernelChProfilingEnabled(int eActivationMask) {
-  bool enabled = ncclPrimProfileEnabled() || (ncclProfilerPluginLoaded() && (eActivationMask & ncclProfileKernelCh));
-  static int callCount = 0;
-  if (callCount < 5) {
-    fprintf(stderr, "[RCCL-PROFILE-DEBUG] ncclKernelChProfilingEnabled(mask=%d) = %d\n", eActivationMask, (int)enabled);
-    callCount++;
-  }
-  return enabled;
+  return ncclPrimProfileEnabled() || (ncclProfilerPluginLoaded() && (eActivationMask & ncclProfileKernelCh));
 }
 
 ncclResult_t ncclProfilerCallback(void** eHandle, int type, void* pHandle, int64_t pluginId, void* extData) {

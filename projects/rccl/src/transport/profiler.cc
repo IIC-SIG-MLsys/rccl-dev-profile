@@ -79,17 +79,7 @@ static inline void ncclProfilerLogPrimSummary(
     const struct ncclDevProfilerRecord* stopRec
   ) {
   if (!ncclPrimProfileEnabled()) return;
-  static int callCount = 0;
-  if (callCount < 3) {
-    fprintf(stderr, "[RCCL-PROFILE-DEBUG] ncclProfilerLogPrimSummary() called, opCount=%llu\n", (unsigned long long)args->opCount);
-    fflush(stderr);
-    callCount++;
-  }
-  if (stopRec->counter < sub->base) {
-    fprintf(stderr, "[RCCL-PROFILE-DEBUG] LogPrim counter=%llu < base=%llu, skipping\n", (unsigned long long)stopRec->counter, (unsigned long long)sub->base);
-    fflush(stderr);
-    return;
-  }
+  if (stopRec->counter < sub->base) return;
 
   uint64_t startClk = stopRec->tbStart;
   uint64_t stopClk = stopRec->tbStop;
@@ -233,13 +223,8 @@ static ncclResult_t profilerProxyConnect(struct ncclProxyConnection* connection,
 }
 
 static ncclResult_t profilerProxyProgress(struct ncclProxyState* proxyState, struct ncclProxyArgs* args) {
-  static int callCount = 0;
-  if (callCount < 10) {
-    fprintf(stderr, "[RCCL-PROFILE-DEBUG] profilerProxyProgress() state=%d nsubs=%d stop=%d\n",
-            (int)args->state, args->nsubs, proxyState->progressState.stop);
-    fflush(stderr);
-    callCount++;
-  }
+  fprintf(stderr, "[RCCL-PROFILE] profilerProxyProgress ENTER state=%d nsubs=%d\n", (int)args->state, args->nsubs);
+  fflush(stderr);
   if (args->state == ncclProxyOpReady) {
     for (int s = 0; s < args->nsubs; s++) {
       struct ncclProxySubArgs* sub = args->subs + s;
@@ -255,15 +240,6 @@ static ncclResult_t profilerProxyProgress(struct ncclProxyState* proxyState, str
       struct ncclDevProfilerStart* workStarted = (struct ncclDevProfilerStart *)sub->sendbuff;
       struct ncclDevProfiler* workCompleted = (struct ncclDevProfiler *)sub->recvbuff;
       int idx = sub->base % MAX_PROFILER_EVENTS_PER_CHANNEL;
-      static int debugCount = 0;
-      if (debugCount < 10) {
-        fprintf(stderr, "[RCCL-PROFILE-DEBUG] ch=%d base=%llu posted=%d transmitted=%d started_ctr=%llu completed_ctr=%llu\n",
-                sub->channelId, (unsigned long long)sub->base, sub->posted, sub->transmitted,
-                (unsigned long long)workStarted[sub->channelId].data[idx].counter,
-                (unsigned long long)workCompleted[sub->channelId].data[idx].counter);
-        fflush(stderr);
-        debugCount++;
-      }
       if (sub->posted < sub->nsteps) {
         if (sub->base <= workStarted[sub->channelId].data[idx].counter) {
           ncclProfilerStartKernelChEvent(args, s, workStarted[sub->channelId].data[idx].timestamp);
